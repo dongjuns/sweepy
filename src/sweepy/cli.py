@@ -7,8 +7,6 @@ import ast
 import subprocess
 import tempfile
 import shutil
-import urllib.request
-import json
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -116,11 +114,8 @@ class RepoAnalyzer:
             'bitbucket.org' in path
         )
     
-    def _parse_github_url(self, url: str) -> tuple[str, str, str]:
+    def _parse_github_url(self, url: str) -> tuple[str, str, str | None]:
         """GitHub URL에서 owner, repo, branch 추출"""
-        # https://github.com/owner/repo/tree/branch
-        # https://github.com/owner/repo/tree/feature/something
-        # https://github.com/owner/repo
         url = url.replace('.git', '')
         parts = url.split('github.com/')[-1].split('/')
         owner = parts[0]
@@ -128,102 +123,38 @@ class RepoAnalyzer:
         branch = None
         
         if len(parts) > 3 and parts[2] == 'tree':
-            # tree/ 이후 전체를 branch로 (feature/something 같은 경우 처리)
             branch = '/'.join(parts[3:])
-        
-        # branch가 없으면 기본 브랜치 확인
-        if not branch:
-            branch = self._get_default_branch(owner, repo)
         
         return owner, repo, branch
     
-    def _get_default_branch(self, owner: str, repo: str) -> str:
-        """GitHub API로 기본 브랜치 확인"""
-        api_url = f"https://api.github.com/repos/{owner}/{repo}"
-        req = urllib.request.Request(api_url)
-        req.add_header('User-Agent', 'sweepy')
-        
-        with urllib.request.urlopen(req) as response:
-            data = json.loads(response.read().decode())
-            return data.get('default_branch', 'main')
-    
-    def _fetch_github_files(self) -> list[tuple[str, str]]:
-        """GitHub API로 Python 파일 목록과 내용 가져오기"""
-        owner, repo, branch = self._parse_github_url(self.original_path)
-        
-        # 파일 트리 가져오기
-        tree_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
-        req = urllib.request.Request(tree_url)
-        req.add_header('User-Agent', 'sweepy')
-        
-        with urllib.request.urlopen(req) as response:
-            tree_data = json.loads(response.read().decode())
-        
-        files = []
-        for item in tree_data.get('tree', []):
-            if item['type'] != 'blob':
-                continue
-            path = item['path']
-            if not path.endswith('.py'):
-                continue
-            if self._should_skip_path(path):
-                continue
-            
-            # 파일 내용 가져오기
-            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
-            req = urllib.request.Request(raw_url)
-            req.add_header('User-Agent', 'sweepy')
-            
-            with urllib.request.urlopen(req) as response:
-                content = response.read().decode('utf-8')
-            files.append((path, content))
-        
-        return files
-    
-    def _should_skip_path(self, path: str) -> bool:
-        """경로 문자열로 스킵 여부 확인"""
-        parts = path.split('/')
-        for part in parts:
-            if part in self.exclude_dirs:
-                return True
-        filename = parts[-1]
-        if filename in self.exclude_files:
-            return True
-        return False
-    
-    def _normalize_git_url(self, url: str) -> str:
-        """브라우저 URL을 git clone 가능한 URL로 변환"""
-        if 'github.com' in url:
-            parts = url.split('github.com/')[-1].split('/')
-            if len(parts) >= 2:
-                user, repo = parts[0], parts[1]
-                repo = repo.replace('.git', '')
-                return f"https://github.com/{user}/{repo}.git"
-        
-        if 'gitlab.com' in url:
-            parts = url.split('gitlab.com/')[-1].split('/')
-            if len(parts) >= 2:
-                user, repo = parts[0], parts[1]
-                repo = repo.replace('.git', '')
-                return f"https://gitlab.com/{user}/{repo}.git"
-        
-        if 'bitbucket.org' in url:
-            parts = url.split('bitbucket.org/')[-1].split('/')
-            if len(parts) >= 2:
-                user, repo = parts[0], parts[1]
-                repo = repo.replace('.git', '')
-                return f"https://bitbucket.org/{user}/{repo}.git"
-        
-        return url
-    
     def _clone_repo(self, url: str) -> Path:
         self.temp_dir = tempfile.mkdtemp()
-        normalized_url = self._normalize_git_url(url)
-        subprocess.run(
-            ['git', 'clone', '--depth', '1', normalized_url, self.temp_dir],
-            check=True,
-            capture_output=True
-        )
+        
+        if 'github.com' in url:
+            owner, repo, branch = self._parse_github_url(url)
+            clone_url = f"https://github.com/{owner}/{repo}.git"
+            
+            cmd = ['git', 'clone', '--depth', '1']
+            if branch:
+                cmd.extend(['-b', branch])
+            cmd.extend([clone_url, self.temp_dir])
+        
+        elif 'gitlab.com' in url:
+            parts = url.split('gitlab.com/')[-1].split('/')
+            user, repo = parts[0], parts[1].replace('.git', '')
+            clone_url = f"https://gitlab.com/{user}/{repo}.git"
+            cmd = ['git', 'clone', '--depth', '1', clone_url, self.temp_dir]
+        
+        elif 'bitbucket.org' in url:
+            parts = url.split('bitbucket.org/')[-1].split('/')
+            user, repo = parts[0], parts[1].replace('.git', '')
+            clone_url = f"https://bitbucket.org/{user}/{repo}.git"
+            cmd = ['git', 'clone', '--depth', '1', clone_url, self.temp_dir]
+        
+        else:
+            cmd = ['git', 'clone', '--depth', '1', url, self.temp_dir]
+        
+        subprocess.run(cmd, check=True, capture_output=True)
         return Path(self.temp_dir)
     
     def _cleanup(self):
@@ -233,11 +164,6 @@ class RepoAnalyzer:
     def analyze(self) -> AnalysisResult:
         result = AnalysisResult(repo_path=self.original_path)
         
-        # GitHub URL이면 API로 처리
-        if self.is_github:
-            return self._analyze_github(result)
-        
-        # 그 외 원격이면 clone
         if self.is_remote:
             self.root = self._clone_repo(self.original_path)
         else:
