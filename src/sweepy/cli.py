@@ -1,9 +1,12 @@
 """
-Unused Import Detector Agent (Repository-level)
-레포지토리 전체를 brute force로 스캔하여 미사용 import 탐지
+sweepy - Sweep away unused imports from your codebase
+Git repository URL 또는 로컬 경로를 받아서 미사용 import 탐지
 """
 
 import ast
+import subprocess
+import tempfile
+import shutil
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -15,7 +18,7 @@ DEFAULT_EXCLUDE_DIRS = {
 }
 
 DEFAULT_EXCLUDE_FILES = {
-    '__init__.py',  # re-export 용도로 import만 하는 경우 많음
+    '__init__.py',
 }
 
 
@@ -28,6 +31,7 @@ class UnusedImport:
 
 @dataclass
 class AnalysisResult:
+    repo_path: str
     unused_imports: list[UnusedImport] = field(default_factory=list)
     files_analyzed: int = 0
     files_skipped: int = 0
@@ -38,11 +42,20 @@ class AnalysisResult:
         for item in self.unused_imports:
             result.setdefault(item.file, []).append(item)
         return result
+    
+    def summary(self) -> str:
+        lines = [
+            f"Repository: {self.repo_path}",
+            f"Files analyzed: {self.files_analyzed}",
+            f"Files skipped: {self.files_skipped}",
+            f"Unused imports: {len(self.unused_imports)}",
+        ]
+        return "\n".join(lines)
 
 
 class UnusedImportDetector(ast.NodeVisitor):
     def __init__(self):
-        self.imports: dict[str, int] = {}  # name -> line
+        self.imports: dict[str, int] = {}
         self.used_names: set[str] = set()
     
     def visit_Import(self, node: ast.Import):
@@ -79,16 +92,47 @@ class UnusedImportDetector(ast.NodeVisitor):
 class RepoAnalyzer:
     def __init__(
         self,
-        repo_path: str | Path,
+        repo_path: str,
         exclude_dirs: set[str] | None = None,
         exclude_files: set[str] | None = None
     ):
-        self.root = Path(repo_path).resolve()
+        self.original_path = repo_path
+        self.is_remote = self._is_git_url(repo_path)
+        self.temp_dir: str | None = None
         self.exclude_dirs = exclude_dirs or DEFAULT_EXCLUDE_DIRS
         self.exclude_files = exclude_files or DEFAULT_EXCLUDE_FILES
+        self.root: Path | None = None
+    
+    def _is_git_url(self, path: str) -> bool:
+        return (
+            path.startswith('https://') or 
+            path.startswith('git@') or
+            path.startswith('http://') or
+            'github.com' in path or
+            'gitlab.com' in path or
+            'bitbucket.org' in path
+        )
+    
+    def _clone_repo(self, url: str) -> Path:
+        self.temp_dir = tempfile.mkdtemp()
+        subprocess.run(
+            ['git', 'clone', '--depth', '1', url, self.temp_dir],
+            check=True,
+            capture_output=True
+        )
+        return Path(self.temp_dir)
+    
+    def _cleanup(self):
+        if self.temp_dir and Path(self.temp_dir).exists():
+            shutil.rmtree(self.temp_dir)
     
     def analyze(self) -> AnalysisResult:
-        result = AnalysisResult()
+        if self.is_remote:
+            self.root = self._clone_repo(self.original_path)
+        else:
+            self.root = Path(self.original_path).resolve()
+        
+        result = AnalysisResult(repo_path=self.original_path)
         
         for py_file in self.root.rglob('*.py'):
             if self._should_skip(py_file):
@@ -96,14 +140,9 @@ class RepoAnalyzer:
                 continue
             
             rel_path = str(py_file.relative_to(self.root))
-            
             source = py_file.read_text(encoding='utf-8')
             
-            # syntax 검증
-            code = compile(source, rel_path, 'exec', ast.PyCF_ONLY_AST)
-            if code is None:
-                result.parse_errors.append((rel_path, "Failed to compile"))
-                continue
+            compile(source, rel_path, 'exec', ast.PyCF_ONLY_AST)
             
             tree = ast.parse(source)
             detector = UnusedImportDetector()
@@ -116,15 +155,16 @@ class RepoAnalyzer:
             
             result.files_analyzed += 1
         
+        if self.is_remote:
+            self._cleanup()
+        
         return result
     
     def _should_skip(self, path: Path) -> bool:
-        # 디렉토리 체크
         for part in path.relative_to(self.root).parts:
             if part in self.exclude_dirs:
                 return True
         
-        # 파일명 체크
         if path.name in self.exclude_files:
             return True
         
@@ -133,11 +173,9 @@ class RepoAnalyzer:
 
 def print_report(result: AnalysisResult):
     print(f"\n{'='*60}")
-    print("UNUSED IMPORT ANALYSIS REPORT")
+    print("SWEEPY ANALYSIS REPORT")
     print(f"{'='*60}")
-    print(f"Files analyzed: {result.files_analyzed}")
-    print(f"Files skipped:  {result.files_skipped}")
-    print(f"Unused imports: {len(result.unused_imports)}")
+    print(result.summary())
     
     if result.parse_errors:
         print(f"\nParse errors ({len(result.parse_errors)}):")
@@ -160,44 +198,58 @@ def print_report(result: AnalysisResult):
     print("   ruff check --fix <file>")
 
 
-if __name__ == "__main__":
+def analyze(repo: str) -> AnalysisResult:
+    """
+    메인 API 함수
+    
+    Args:
+        repo: Git URL 또는 로컬 경로
+              - https://github.com/user/repo.git
+              - git@github.com:user/repo.git
+              - /path/to/local/repo
+    
+    Returns:
+        AnalysisResult 객체
+    """
+    analyzer = RepoAnalyzer(repo)
+    return analyzer.analyze()
+
+
+def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="Repository-level unused import detector"
+        description="sweepy - Sweep away unused imports"
     )
     parser.add_argument(
         "repo",
-        nargs="?",
-        default=".",
-        help="Repository root path (default: current directory)"
+        help="Git repository URL or local path"
     )
     parser.add_argument(
         "--exclude-dir",
         action="append",
         default=[],
-        help="Additional directories to exclude (can be used multiple times)"
+        help="Additional directories to exclude"
     )
     parser.add_argument(
         "--exclude-file",
         action="append",
         default=[],
-        help="Additional files to exclude (can be used multiple times)"
+        help="Additional files to exclude"
     )
     
     args = parser.parse_args()
     
-    repo_path = Path(args.repo)
-    if not repo_path.is_dir():
-        print(f"[ERROR] Not a directory: {repo_path}")
-        exit(1)
-    
     exclude_dirs = DEFAULT_EXCLUDE_DIRS | set(args.exclude_dir)
     exclude_files = DEFAULT_EXCLUDE_FILES | set(args.exclude_file)
     
-    analyzer = RepoAnalyzer(repo_path, exclude_dirs, exclude_files)
+    analyzer = RepoAnalyzer(args.repo, exclude_dirs, exclude_files)
     result = analyzer.analyze()
     
     print_report(result)
     
     exit(1 if result.unused_imports else 0)
+
+
+if __name__ == "__main__":
+    main()
